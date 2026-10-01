@@ -1,0 +1,6 @@
+lxml
+pyquery
+requests
+cachetools
+pycryptodome
+beautifulsoup4
