@@ -13,16 +13,23 @@ import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.Util;
-import androidx.media3.ui.DefaultTimeBar;
 import androidx.media3.ui.TimeBar;
 
 import com.fongmi.android.tv.R;
+import com.fongmi.android.tv.download.DownloadManifest;
 import com.fongmi.android.tv.player.cache.PlaybackDiskBufferStore;
+import com.fongmi.android.tv.player.cache.PlaybackCachedRangeIndex;
+import com.fongmi.android.tv.player.exo.SharedMediaCache;
 import com.github.catvod.crawler.SpiderDebug;
 
 import java.util.Formatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class CustomSeekView extends FrameLayout implements Player.Listener, TimeBar.OnScrubListener {
 
@@ -32,12 +39,13 @@ public class CustomSeekView extends FrameLayout implements Player.Listener, Time
     private static final long PAUSED_BUFFER_LOG_INTERVAL_MS = 5000;
     private static final long SEEK_POSITION_TOLERANCE_MS = 1500;
     private static final long SEEK_POSITION_HOLD_TIMEOUT_MS = 10000;
+    private static final ExecutorService RANGE_READER = Executors.newSingleThreadExecutor();
 
     private final StringBuilder timeBuilder = new StringBuilder();
     private final Formatter timeFormatter = new Formatter(timeBuilder, Locale.getDefault());
     private final TextView positionView;
     private final TextView durationView;
-    private final DefaultTimeBar timeBar;
+    private final CachedRangeTimeBar timeBar;
     private final Runnable runnable;
     private long currentDuration;
     private long currentPosition;
@@ -53,6 +61,9 @@ public class CustomSeekView extends FrameLayout implements Player.Listener, Time
     private long pendingSeekPosition = C.TIME_UNSET;
     private long pendingSeekOrigin = C.TIME_UNSET;
     private long pendingSeekDeadlineMs;
+    private String downloadTaskId;
+    private int downloadGeneration;
+    private long lastRangeRefreshAtMs;
 
     public CustomSeekView(Context context) {
         this(context, null);
@@ -79,6 +90,15 @@ public class CustomSeekView extends FrameLayout implements Player.Listener, Time
         this.player = player;
         if (player != null) player.addListener(this);
         if (attached) updateTimeline();
+    }
+
+    public void setDownloadTaskId(@Nullable String taskId) {
+        if (java.util.Objects.equals(downloadTaskId, taskId)) return;
+        downloadTaskId = taskId;
+        downloadGeneration++;
+        lastRangeRefreshAtMs = 0;
+        setDisplayedRanges(List.of());
+        if (attached) updateDownloadedRanges();
     }
 
     /**
@@ -146,12 +166,89 @@ public class CustomSeekView extends FrameLayout implements Player.Listener, Time
             currentBuffered = buffered;
             timeBar.setBufferedPosition(buffered);
         }
+        updateDownloadedRanges();
         logPausedBufferProgress(progress, position, buffered);
         if (progress.isPlaying()) {
             postDelayed(runnable, delayMs(progress, position));
         } else {
             postDelayed(runnable, MAX_UPDATE_INTERVAL_MS);
         }
+    }
+
+    private void updateDownloadedRanges() {
+        String taskId = downloadTaskId;
+        if (!attached) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastRangeRefreshAtMs < 2000) return;
+        lastRangeRefreshAtMs = now;
+        int generation = downloadGeneration;
+        long timelineDuration = currentDuration;
+        Player progress = getProgressPlayer();
+        MediaItem mediaItem = progress == null ? null : progress.getCurrentMediaItem();
+        String mediaKey = PlaybackDiskBufferStore.mediaKey(mediaItem);
+        String mediaUri = mediaItem == null || mediaItem.localConfiguration == null ? ""
+                : mediaItem.localConfiguration.uri.toString();
+        String mimeType = mediaItem == null || mediaItem.localConfiguration == null ? ""
+                : mediaItem.localConfiguration.mimeType;
+        android.content.Context context = getContext().getApplicationContext();
+        RANGE_READER.execute(() -> {
+            DownloadManifest manifest = taskId == null || taskId.isEmpty()
+                    ? null : DownloadManifest.load(context, taskId);
+            List<DownloadManifest.Range> ranges = new ArrayList<>();
+            if (manifest != null) {
+                try {
+                    long manifestDuration = manifest.durationMs();
+                    addScaledRanges(ranges, manifest.downloadedRanges(context, taskId),
+                            manifestDuration, timelineDuration);
+                    addScaledRanges(ranges, SharedMediaCache.cachedRanges(manifest),
+                            manifestDuration, timelineDuration);
+                } catch (java.io.IOException | RuntimeException ignored) { }
+            }
+            for (PlaybackDiskBufferStore.Range range :
+                    PlaybackDiskBufferStore.process().completedRanges(mediaKey)) {
+                ranges.add(new DownloadManifest.Range(range.startMs(), range.endMs()));
+            }
+            SharedMediaCache.PlaybackRanges playback = SharedMediaCache.cachedPlaybackRanges(
+                    mediaUri, mimeType, timelineDuration);
+            addScaledRanges(ranges, playback.ranges(), playback.durationMs(), timelineDuration);
+            try { ranges.addAll(PlaybackCachedRangeIndex.get().ranges(mediaUri)); }
+            catch (RuntimeException ignored) { }
+            post(() -> {
+                if (attached && generation == downloadGeneration) {
+                    setDisplayedRanges(ranges);
+                }
+            });
+        });
+    }
+
+    private static void addScaledRanges(List<DownloadManifest.Range> target,
+                                        List<DownloadManifest.Range> source,
+                                        long sourceDuration, long targetDuration) {
+        if (sourceDuration <= 0 || targetDuration <= 0) return;
+        for (DownloadManifest.Range range : source) {
+            long start = Math.round(targetDuration * Math.max(0, range.startMs())
+                    / (double) sourceDuration);
+            long end = Math.round(targetDuration * Math.max(0, range.endMs())
+                    / (double) sourceDuration);
+            if (end > start) target.add(new DownloadManifest.Range(
+                    Math.min(targetDuration, start), Math.min(targetDuration, end)));
+        }
+    }
+
+    private void setDisplayedRanges(List<DownloadManifest.Range> ranges) {
+        List<DownloadManifest.Range> sorted = new ArrayList<>(ranges);
+        sorted.sort(Comparator.comparingLong(DownloadManifest.Range::startMs));
+        List<DownloadManifest.Range> merged = new ArrayList<>();
+        for (DownloadManifest.Range range : sorted) {
+            if (merged.isEmpty() || range.startMs() > merged.get(merged.size() - 1).endMs()) {
+                merged.add(range);
+            } else {
+                DownloadManifest.Range previous = merged.remove(merged.size() - 1);
+                merged.add(new DownloadManifest.Range(previous.startMs(),
+                        Math.max(previous.endMs(), range.endMs())));
+            }
+        }
+        timeBar.setCachedRanges(merged);
     }
 
     private long effectiveBufferedPosition(Player progress) {
@@ -303,6 +400,9 @@ public class CustomSeekView extends FrameLayout implements Player.Listener, Time
     @Override
     public void onMediaItemTransition(@Nullable MediaItem mediaItem, int reason) {
         resetView();
+        downloadGeneration++;
+        lastRangeRefreshAtMs = 0;
+        setDisplayedRanges(List.of());
     }
 
     @Override

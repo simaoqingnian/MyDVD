@@ -335,6 +335,7 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
     }
 
     public void refreshWebHomeChromeState() {
+        refreshWebHomeChromeLayout();
         onWebHomeChromeChanged(getWebHomeChromeMode());
     }
 
@@ -368,7 +369,9 @@ public class HomeActivity extends BaseActivity implements NavigationBarView.OnIt
 
     @Override
     public boolean isWebHomeChromeActive() {
-        return mManager != null && mManager.isVisible(0);
+        if (mManager == null || !mManager.isVisible(0)) return false;
+        VodFragment fragment = (VodFragment) mManager.getFragment(0);
+        return fragment != null && fragment.isWebHomeReady();
     }
 
     @Override

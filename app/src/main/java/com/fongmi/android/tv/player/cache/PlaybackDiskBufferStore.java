@@ -56,6 +56,11 @@ public final class PlaybackDiskBufferStore {
         return result;
     }
 
+    public synchronized List<Range> completedRanges(String mediaKey) {
+        RangeSet ranges = mediaRanges.get(mediaKey);
+        return ranges == null ? new ArrayList<>() : new ArrayList<>(ranges.ranges);
+    }
+
     /** Returns the native or disk-backed end, bounded to the known media duration. */
     public synchronized long effectiveEnd(
             String mediaKey, long nativeBufferedEndMs, long durationMs, long gapToleranceMs) {
@@ -139,7 +144,7 @@ public final class PlaybackDiskBufferStore {
         }
     }
 
-    private record Range(long startMs, long endMs) {
+    public record Range(long startMs, long endMs) {
     }
 
     private record QueryLogState(long resultMs, long loggedAtMs) {

@@ -187,7 +187,7 @@ public class VodFragment extends BaseFragment implements ConfigListener, SiteLis
         }
         mResultSourceUrl = getConfig().getUrl();
         mResultSiteKey = homeKey();
-        boolean replaceDisplayedHome = hasCurrentHome();
+        boolean replaceDisplayedHome = mResult != null;
         mAdapter.addAll(mResult = result);
         if (replaceDisplayedHome) mBinding.pager.setAdapter(new PageAdapter(getChildFragmentManager()));
         else notifyPagerAdapter();
@@ -417,10 +417,11 @@ public class VodFragment extends BaseFragment implements ConfigListener, SiteLis
 
     private void homeContent() {
         requestNormalChrome();
+        mBinding.homeWeb.setVisibility(View.GONE);
+        if (!hasCurrentHome()) showCachedHome();
         boolean keepCurrent = hasCurrentHome();
         if (keepCurrent) hideProgress();
         else showProgress();
-        mBinding.homeWeb.setVisibility(View.GONE);
         updateToolbarMenu();
         if (!keepCurrent) {
             clearPagerTypes();
@@ -589,11 +590,15 @@ public class VodFragment extends BaseFragment implements ConfigListener, SiteLis
     @Override
     public void onWebLoading() {
         showProgress();
+        HomeActivity activity = homeActivity();
+        if (activity != null) activity.refreshWebHomeChromeState();
     }
 
     @Override
     public void onWebReady() {
         hideProgress();
+        HomeActivity activity = homeActivity();
+        if (activity != null) activity.refreshWebHomeChromeState();
     }
 
     @Override
@@ -723,7 +728,12 @@ public class VodFragment extends BaseFragment implements ConfigListener, SiteLis
     }
 
     private boolean isNativeChromeHidden() {
-        return WebHomeChrome.hidesNativeChrome(mChromeMode);
+        return isWebHomeReady() && WebHomeChrome.hidesNativeChrome(mChromeMode);
+    }
+
+    public boolean isWebHomeReady() {
+        return mWeb != null && mWeb.isVisible()
+                && mBinding != null && mBinding.progress.getRoot().getVisibility() != View.VISIBLE;
     }
 
     private void syncWebHomeChrome() {

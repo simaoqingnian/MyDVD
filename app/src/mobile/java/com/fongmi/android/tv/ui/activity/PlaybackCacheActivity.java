@@ -29,14 +29,21 @@ import com.fongmi.android.tv.setting.PlaybackPerformanceSetting;
 import com.fongmi.android.tv.setting.PreloadSetting;
 
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class PlaybackCacheActivity extends AppCompatActivity {
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService statsWorker = Executors.newSingleThreadExecutor();
+    private final Map<String, TextView> statsViews = new HashMap<>();
     private LinearLayout list;
     private TextView quota;
+    private Future<?> statsJob;
+    private int refreshGeneration;
 
     public static void start(Activity activity) {
         activity.startActivity(new Intent(activity, PlaybackCacheActivity.class));
@@ -105,23 +112,51 @@ public class PlaybackCacheActivity extends AppCompatActivity {
     }
 
     private void refresh() {
-        list.removeAllViews();
-        list.addView(text("正在读取缓存…", 14));
+        int generation = ++refreshGeneration;
+        if (statsJob != null) statsJob.cancel(true);
         worker.execute(() -> {
             try {
                 List<SharedMediaCache.CachedMovie> movies = SharedMediaCache.listMovies();
-                runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) showMovies(movies); });
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed() || generation != refreshGeneration) return;
+                    showMovies(movies);
+                    if (!movies.isEmpty()) loadSegmentStats(generation);
+                });
             } catch (Exception error) {
-                runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()) {
-                    list.removeAllViews();
-                    list.addView(text("读取缓存失败：" + error.getMessage(), 14));
+                runOnUiThread(() -> { if (!isFinishing() && !isDestroyed()
+                        && generation == refreshGeneration) {
+                    if (list.getChildCount() == 0) list.addView(text("读取缓存失败：" + error.getMessage(), 14));
+                    else Toast.makeText(this, "刷新缓存失败：" + error.getMessage(), Toast.LENGTH_LONG).show();
                 }});
             }
         });
     }
 
+    private void loadSegmentStats(int generation) {
+        statsJob = statsWorker.submit(() -> {
+            try {
+                Map<String, SharedMediaCache.SegmentStats> stats = SharedMediaCache.listMovieSegmentStats();
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed() || generation != refreshGeneration) return;
+                    for (Map.Entry<String, TextView> entry : statsViews.entrySet()) {
+                        SharedMediaCache.SegmentStats value = stats.get(entry.getKey());
+                        if (value == null || value.totalSegments() <= 0) {
+                            entry.getValue().setText("缓存分段 — / — · 无分段清单");
+                        } else {
+                            int percent = (int) Math.round(value.cachedSegments() * 100.0
+                                    / value.totalSegments());
+                            entry.getValue().setText("缓存分段 " + value.cachedSegments() + " / "
+                                    + value.totalSegments() + " · " + percent + "%");
+                        }
+                    }
+                });
+            } catch (RuntimeException ignored) { }
+        });
+    }
+
     private void showMovies(List<SharedMediaCache.CachedMovie> movies) {
         list.removeAllViews();
+        statsViews.clear();
         if (movies.isEmpty()) {
             list.addView(text("暂无可管理的播放缓存", 15));
             return;
@@ -136,6 +171,9 @@ public class PlaybackCacheActivity extends AppCompatActivity {
             row.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
             details.addView(singleLine(movie.title(), 15));
             details.addView(singleLine(PlaybackOrigin.sourceLabel(movie.siteKey(), movie.id()), 12));
+            TextView segments = singleLine("缓存分段计算中…", 12);
+            details.addView(segments);
+            statsViews.put(movie.id(), segments);
             details.addView(text(Formatter.formatFileSize(this, movie.bytes())
                     + (movie.protectedFromDeletion() ? " · 播放或下载中" : ""), 12));
             Button open = new Button(this);
@@ -203,6 +241,8 @@ public class PlaybackCacheActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        if (statsJob != null) statsJob.cancel(true);
+        statsWorker.shutdownNow();
         worker.shutdownNow();
         super.onDestroy();
     }

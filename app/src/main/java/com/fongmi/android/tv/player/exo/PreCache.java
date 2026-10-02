@@ -25,6 +25,7 @@ import com.fongmi.android.tv.player.PlaybackTelemetryCoordinator;
 import com.fongmi.android.tv.player.PlaybackTrace;
 import com.fongmi.android.tv.player.PreloadPausePolicy;
 import com.fongmi.android.tv.player.cache.PlaybackDiskBufferStore;
+import com.fongmi.android.tv.player.cache.PlaybackCachedRangeIndex;
 import com.fongmi.android.tv.setting.PlaybackPerformanceSetting;
 import com.fongmi.android.tv.setting.PlaybackPerformanceCatalog;
 import com.fongmi.android.tv.setting.PlaybackExperimentSetting;
@@ -90,6 +91,7 @@ public class PreCache implements Player.Listener {
     private long taskPreparedDurationMs = C.TIME_UNSET;
     private long taskCacheBytesBefore;
     private String mediaKey = "";
+    private String mediaUri = "";
     private boolean playable;
     private boolean refillActive;
     private boolean seekPreloadSuppressed;
@@ -147,6 +149,8 @@ public class PreCache implements Player.Listener {
         this.player = player;
         this.handler = new Handler(player.getApplicationLooper());
         this.mediaKey = PlaybackDiskBufferStore.mediaKey(mediaItem);
+        this.mediaUri = mediaItem.localConfiguration == null ? ""
+                : mediaItem.localConfiguration.uri.toString();
         this.diskBufferStore.reset(mediaKey);
         this.routeResolution = routeResolution == null ? PlaybackRoute.resolve(mediaItem.localConfiguration.uri.toString()) : routeResolution;
         this.route = this.routeResolution.route();
@@ -213,6 +217,7 @@ public class PreCache implements Player.Listener {
         helper = null;
         player = null;
         mediaKey = "";
+        mediaUri = "";
         route = null;
         routeResolution = PlaybackRoute.resolve(null);
         playbackTraceId = PlaybackTrace.NONE;
@@ -1099,7 +1104,9 @@ public class PreCache implements Player.Listener {
         transition(state, reason, "generation=%d task=%d", event.generation(), event.taskId());
         if (outcome == PreloadLifecycleTracker.TaskEvent.Outcome.COMPLETED) {
             preloadFailureStreak = 0;
-            diskBufferStore.recordCompleted(mediaKey, event.startMs(), saturatedAdd(event.startMs(), event.lengthMs()));
+            long endMs = saturatedAdd(event.startMs(), event.lengthMs());
+            diskBufferStore.recordCompleted(mediaKey, event.startMs(), endMs);
+            PlaybackCachedRangeIndex.get().recordMedia3(mediaUri, mediaUri, event.startMs(), endMs);
             requestImmediateCheck(event.generation());
         }
         return event;

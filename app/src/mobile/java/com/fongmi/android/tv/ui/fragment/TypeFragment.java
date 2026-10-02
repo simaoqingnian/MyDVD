@@ -14,6 +14,7 @@ import androidx.viewbinding.ViewBinding;
 
 import com.fongmi.android.tv.Product;
 import com.fongmi.android.tv.api.config.VodConfig;
+import com.fongmi.android.tv.browse.BrowseSnapshot;
 import com.fongmi.android.tv.bean.Result;
 import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.bean.Style;
@@ -135,8 +136,20 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
         mAdapter.clear(() -> {
             if (!mBinding.swipeLayout.isRefreshing()) mBinding.progressLayout.showProgress();
             if (isHome()) setAdapter(getParent().getResult());
-            else getVideo(getTypeId(), "1");
+            else {
+                Result cached = BrowseSnapshot.loadCategory(VodConfig.getUrl(), getKey(),
+                        getTypeId(), mExtends);
+                if (cached != null) showCachedCategory(cached);
+                getVideo(getTypeId(), "1");
+            }
         });
+    }
+
+    private void showCachedCategory(Result cached) {
+        Style style = cached.getVod().getStyle(getStyle());
+        if (!style.equals(mAdapter.getStyle())) setStyle(style);
+        mAdapter.setItems(cached.getList());
+        mBinding.progressLayout.showContent(true, cached.getList().size());
     }
 
     private void getVideo(String typeId, String page) {
@@ -146,16 +159,19 @@ public class TypeFragment extends BaseFragment implements CustomScroller.Callbac
     private void setAdapter(Result result) {
         boolean first = mScroller.first();
         int size = result.getList().size();
-        mBinding.progressLayout.showContent(first, size);
+        mBinding.progressLayout.showContent(first, size > 0 ? size : mAdapter.getItemCount());
         mBinding.swipeLayout.setRefreshing(false);
         mScroller.endLoading(result);
-        if (size > 0) addVideo(result);
+        if (size > 0) addVideo(result, first);
+        else if (first && mAdapter.getItemCount() > 0)
+            Notify.show("未取得新列表，显示上次缓存");
     }
 
-    private void addVideo(Result result) {
+    private void addVideo(Result result, boolean first) {
         Style style = result.getVod().getStyle(getStyle());
         if (!style.equals(mAdapter.getStyle())) setStyle(style);
-        mAdapter.addAll(result.getList(), this::checkMore);
+        if (first) mAdapter.setItems(result.getList(), this::checkMore);
+        else mAdapter.addAll(result.getList(), this::checkMore);
     }
 
     private void checkMore() {

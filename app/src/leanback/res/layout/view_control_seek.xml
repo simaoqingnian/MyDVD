@@ -15,7 +15,7 @@
         android:textSize="16sp"
         tools:text="00:00:00" />
 
-    <androidx.media3.ui.DefaultTimeBar
+    <com.fongmi.android.tv.ui.custom.CachedRangeTimeBar
         android:id="@+id/timeBar"
         android:layout_width="0dp"
         android:layout_height="wrap_content"

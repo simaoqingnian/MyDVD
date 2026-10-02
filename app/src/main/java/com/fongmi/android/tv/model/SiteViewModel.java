@@ -11,6 +11,7 @@ import com.fongmi.android.tv.api.config.VodConfig;
 import com.fongmi.android.tv.bean.Result;
 import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.browse.HomeSnapshot;
+import com.fongmi.android.tv.browse.BrowseSnapshot;
 import com.fongmi.android.tv.exception.ExtractException;
 import com.fongmi.android.tv.player.karaoke.KaraokeResult;
 import com.fongmi.android.tv.setting.SiteHealthStore;
@@ -117,12 +118,18 @@ public class SiteViewModel extends ViewModel {
     public void homeContent() {
         Site home = VodConfig.get().getHome();
         String sourceUrl = VodConfig.getUrl();
-        execute(TaskType.RESULT, result, () -> SiteApi.homeContent(home),
+        execute(TaskType.RESULT, result, () -> HomeSnapshot.complete(sourceUrl, home.getKey(),
+                        SiteApi.homeContent(home)),
                 value -> HomeSnapshot.save(sourceUrl, home.getKey(), value), null);
     }
 
     public void categoryContent(String key, String tid, String page, boolean filter, HashMap<String, String> extend) {
-        execute(TaskType.RESULT, result, () -> SiteApi.categoryContent(key, tid, page, filter, extend));
+        String sourceUrl = VodConfig.getUrl();
+        HashMap<String, String> filters = new HashMap<>(extend);
+        execute(TaskType.RESULT, result, () -> SiteApi.categoryContent(key, tid, page, filter, filters),
+                value -> {
+                    if ("1".equals(page)) BrowseSnapshot.saveCategory(sourceUrl, key, tid, filters, value);
+                }, null);
     }
 
     public void action(String key, String act) {

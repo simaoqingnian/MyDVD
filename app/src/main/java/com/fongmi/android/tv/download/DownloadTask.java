@@ -10,6 +10,10 @@ public class DownloadTask {
     public static final String PAUSED = "paused";
     public static final String FAILED = "failed";
     public static final String DONE = "done";
+    public static final String DOWNLOADED = "downloaded";
+    public static final String EXPORTING = "exporting";
+    public static final String EXPORT_FAILED = "export_failed";
+    public static final String EXPORTED = "exported";
     public static final String DELETING = "deleting";
     public static final String DELETE_FAILED = "delete_failed";
 
@@ -26,6 +30,8 @@ public class DownloadTask {
     public String error;
     public String outputUri;
     public int progress;
+    public int segmentsDownloaded;
+    public int segmentsTotal;
 
     public DownloadTask() {
     }

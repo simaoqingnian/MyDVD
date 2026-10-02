@@ -15,9 +15,10 @@
         android:layout_width="match_parent"
         android:layout_height="56dp"
         android:layout_alignParentBottom="true"
-        android:background="@color/transparent"
+        android:background="?attr/colorSurface"
         app:elevation="0dp"
-        app:itemIconTint="@color/selector_nav"
+        app:itemIconTint="@color/selector_home_nav"
+        app:itemTextColor="@color/selector_home_nav"
         app:labelVisibilityMode="unlabeled"
         app:menu="@menu/menu_nav" />
 

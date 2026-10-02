@@ -12,6 +12,7 @@ import com.fongmi.android.tv.player.PlaybackResourceClassifier;
 import com.fongmi.android.tv.player.PlaybackSystemConditionMonitor;
 import com.fongmi.android.tv.player.PreloadPausePolicy;
 import com.fongmi.android.tv.player.cache.PlaybackDiskBufferStore;
+import com.fongmi.android.tv.player.cache.PlaybackCachedRangeIndex;
 import com.fongmi.android.tv.player.mpv.MpvPreloadPolicy;
 import com.fongmi.android.tv.setting.PlayerSetting;
 import com.fongmi.android.tv.setting.PlaybackPerformanceCatalog;
@@ -1177,20 +1178,22 @@ public final class MpvHlsProxy extends NanoHTTPD {
 
     private void recordCachedSegment(
             Session session, HlsPlaylistRewriter.Segment segment) {
-        diskBufferStore.recordCompleted(
-                session.mediaKey(),
-                secondsToMilliseconds(segment.startSeconds()),
-                secondsToMilliseconds(segment.endSeconds()));
+        long startMs = secondsToMilliseconds(segment.startSeconds());
+        long endMs = secondsToMilliseconds(segment.endSeconds());
+        diskBufferStore.recordCompleted(session.mediaKey(), startMs, endMs);
+        PlaybackCachedRangeIndex.get().recordFile(
+                session.url(), cacheFile(session, segment.uri()), startMs, endMs);
     }
 
     private void recordCachedTarget(Session session, Target target) {
         if (target == null
                 || target.role() != HlsPlaylistRewriter.UriRole.MEDIA_SEGMENT
                 || target.durationSeconds() <= 0) return;
-        diskBufferStore.recordCompleted(
-                session.mediaKey(),
-                secondsToMilliseconds(target.startSeconds()),
-                secondsToMilliseconds(target.endSeconds()));
+        long startMs = secondsToMilliseconds(target.startSeconds());
+        long endMs = secondsToMilliseconds(target.endSeconds());
+        diskBufferStore.recordCompleted(session.mediaKey(), startMs, endMs);
+        PlaybackCachedRangeIndex.get().recordFile(
+                session.url(), cacheFile(session, target.url()), startMs, endMs);
     }
 
     private File cacheFile(Session session, String url) {
@@ -1313,6 +1316,17 @@ public final class MpvHlsProxy extends NanoHTTPD {
         if (!result.variants().isEmpty()) stats.recordVariants(result.variants());
         if (stats.vod && !result.segments().isEmpty()) {
             stats.recordSegments(inheritedVariant, result.segments());
+            if (owner != null) {
+                List<PlaybackCachedRangeIndex.FileRange> existing = new ArrayList<>();
+                for (HlsPlaylistRewriter.Segment segment : result.segments()) {
+                    if (segment.byteRange() || !isHttpUrl(segment.uri())) continue;
+                    File file = cacheFile(owner, segment.uri());
+                    existing.add(new PlaybackCachedRangeIndex.FileRange(file,
+                            secondsToMilliseconds(segment.startSeconds()),
+                            secondsToMilliseconds(segment.endSeconds())));
+                }
+                PlaybackCachedRangeIndex.get().recordFilesAsync(owner.url(), existing);
+            }
         } else if (!stats.vod) {
             stats.clearSegments(inheritedVariant);
         }

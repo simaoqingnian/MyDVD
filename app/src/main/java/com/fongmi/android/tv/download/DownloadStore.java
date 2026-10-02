@@ -68,6 +68,48 @@ public final class DownloadStore {
         return null;
     }
 
+    /** Complete raw source takes priority over any separately exported MP4. */
+    public static DownloadTask findCompletedRaw(Context context, String siteKey, String movieId,
+                                                String flag, String episodeId) {
+        List<DownloadTask> tasks = list(context);
+        for (int i = tasks.size() - 1; i >= 0; i--) {
+            DownloadTask task = tasks.get(i);
+            if (!(DownloadTask.DOWNLOADED.equals(task.status)
+                    || DownloadTask.EXPORTED.equals(task.status)
+                    || DownloadTask.EXPORT_FAILED.equals(task.status)
+                    || DownloadTask.EXPORTING.equals(task.status))
+                    || !Objects.equals(siteKey, task.siteKey)
+                    || !Objects.equals(movieId, task.movieId)
+                    || !Objects.equals(flag, task.flag)
+                    || !Objects.equals(episodeId, task.episodeId)) continue;
+            DownloadManifest manifest = DownloadManifest.load(context, task.id);
+            try { if (manifest != null && manifest.complete(context, task.id)) return task; }
+            catch (Exception ignored) { }
+        }
+        return null;
+    }
+
+    public static DownloadTask findTask(Context context, String siteKey, String movieId,
+                                        String flag, String episodeId) {
+        List<DownloadTask> tasks = list(context);
+        for (int i = tasks.size() - 1; i >= 0; i--) {
+            DownloadTask task = tasks.get(i);
+            if (Objects.equals(siteKey, task.siteKey)
+                    && Objects.equals(movieId, task.movieId)
+                    && Objects.equals(flag, task.flag)
+                    && Objects.equals(episodeId, task.episodeId)
+                    && !DownloadTask.DELETING.equals(task.status)) return task;
+        }
+        return null;
+    }
+
+    public static DownloadTask findById(Context context, String id) {
+        for (DownloadTask task : list(context)) {
+            if (Objects.equals(id, task.id)) return task;
+        }
+        return null;
+    }
+
     private static void save(Context context, List<DownloadTask> items) {
         prefs(context).edit().putString(TASKS, App.gson().toJson(items)).apply();
     }
@@ -155,7 +197,6 @@ public final class DownloadStore {
             if (DownloadTask.PAUSED.equals(task.status) || DownloadTask.FAILED.equals(task.status)) {
                 task.status = DownloadTask.QUEUED;
                 task.error = "";
-                task.progress = 0;
                 changed = true;
             }
         }
@@ -168,7 +209,6 @@ public final class DownloadStore {
         for (DownloadTask task : items) {
             if (task.id.equals(id) && DownloadTask.PAUSED.equals(task.status)) {
                 task.status = DownloadTask.QUEUED;
-                task.progress = 0;
                 save(context, items);
                 return true;
             }
@@ -182,10 +222,23 @@ public final class DownloadStore {
             if (task.id.equals(id) && DownloadTask.FAILED.equals(task.status)) {
                 task.status = DownloadTask.QUEUED;
                 task.error = "";
-                task.progress = 0;
                 save(context, items);
                 return true;
             }
+        }
+        return false;
+    }
+
+    public static synchronized boolean requestExport(Context context, String id) {
+        List<DownloadTask> items = list(context);
+        for (DownloadTask task : items) {
+            if (!task.id.equals(id) || !(DownloadTask.DOWNLOADED.equals(task.status)
+                    || DownloadTask.EXPORTED.equals(task.status)
+                    || DownloadTask.EXPORT_FAILED.equals(task.status))) continue;
+            task.status = DownloadTask.EXPORTING;
+            task.error = "";
+            save(context, items);
+            return true;
         }
         return false;
     }
@@ -209,7 +262,9 @@ public final class DownloadStore {
         for (DownloadTask task : items) {
             if (DownloadTask.RUNNING.equals(task.status)) {
                 task.status = DownloadTask.QUEUED;
-                task.progress = 0;
+            } else if (DownloadTask.EXPORTING.equals(task.status)) {
+                task.status = task.outputUri == null || task.outputUri.isEmpty()
+                        ? DownloadTask.DOWNLOADED : DownloadTask.EXPORTED;
             }
         }
         save(context, items);

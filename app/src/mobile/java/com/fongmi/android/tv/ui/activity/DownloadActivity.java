@@ -95,7 +95,9 @@ public class DownloadActivity extends AppCompatActivity {
         if (list == null) return;
         List<DownloadTask> tasks = DownloadStore.list(this);
         StringBuilder state = new StringBuilder();
-        for (DownloadTask task : tasks) state.append(task.id).append(task.status).append(task.progress).append(task.error).append(task.outputUri);
+        for (DownloadTask task : tasks) state.append(task.id).append(task.status).append(task.progress)
+                .append(task.segmentsDownloaded).append(task.segmentsTotal)
+                .append(task.error).append(task.outputUri);
         if (state.toString().equals(lastState)) return;
         lastState = state.toString();
         list.removeAllViews();
@@ -112,11 +114,15 @@ public class DownloadActivity extends AppCompatActivity {
             details.addView(singleLine(PlaybackOrigin.sourceLabel(task.siteKey, task.movieId), 12));
             String label;
             switch (task.status) {
-                case DownloadTask.DONE -> label = "已完成";
+                case DownloadTask.DONE -> label = "旧版 MP4 已导出 · 无原始分段";
+                case DownloadTask.DOWNLOADED -> label = "原始视频已下载 · 待导出 MP4";
+                case DownloadTask.EXPORTING -> label = "正在导出 MP4 · 原始分段保留";
+                case DownloadTask.EXPORT_FAILED -> label = "导出失败 · " + task.error;
+                case DownloadTask.EXPORTED -> label = "MP4 已导出 · 原始分段保留";
                 case DownloadTask.FAILED -> label = "失败 · " + task.error;
                 case DownloadTask.PAUSED -> label = "已暂停 · " + task.progress + "%";
                 case DownloadTask.RUNNING -> label = "下载中 · " + task.progress + "%";
-                case DownloadTask.DELETING -> label = "正在删除任务和文件";
+                case DownloadTask.DELETING -> label = "正在删除原始分段";
                 case DownloadTask.DELETE_FAILED -> label = "删除失败 · " + task.error;
                 default -> label = "等待下载";
             }
@@ -124,6 +130,10 @@ public class DownloadActivity extends AppCompatActivity {
             status.setMaxLines(2);
             status.setEllipsize(TextUtils.TruncateAt.END);
             details.addView(status);
+            if (task.segmentsTotal > 0) {
+                details.addView(singleLine("分段 " + task.segmentsDownloaded + " / "
+                        + task.segmentsTotal + " · " + task.progress + "%", 12));
+            }
             if (DownloadTask.RUNNING.equals(task.status) || DownloadTask.PAUSED.equals(task.status)) {
                 ProgressBar progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
                 progress.setMax(100);
@@ -133,7 +143,8 @@ public class DownloadActivity extends AppCompatActivity {
             LinearLayout actions = new LinearLayout(this);
             actions.setOrientation(LinearLayout.HORIZONTAL);
             details.addView(actions);
-            if (DownloadTask.DONE.equals(task.status) && task.outputUri != null && !task.outputUri.isEmpty()) {
+            if ((DownloadTask.DONE.equals(task.status) || DownloadTask.EXPORTED.equals(task.status))
+                    && task.outputUri != null && !task.outputUri.isEmpty()) {
                 actions.addView(smallButton("播放 MP4", () -> {
                     Intent open = new Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(task.outputUri), "video/mp4");
                     open.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -141,8 +152,13 @@ public class DownloadActivity extends AppCompatActivity {
                     catch (Exception ignored) { android.widget.Toast.makeText(this, "请到下载目录 / MyDVD 打开文件", android.widget.Toast.LENGTH_LONG).show(); }
                 }));
             }
-            actions.addView(smallButton("播放页", () ->
-                    PlaybackOrigin.open(this, task.movieId, task.siteKey, task.movieName)));
+            actions.addView(smallButton("播放页", () -> PlaybackOrigin.open(this, task)));
+            if (DownloadTask.DOWNLOADED.equals(task.status)
+                    || DownloadTask.EXPORT_FAILED.equals(task.status)
+                    || DownloadTask.EXPORTED.equals(task.status)) {
+                actions.addView(smallButton(DownloadTask.EXPORTED.equals(task.status)
+                        ? "再次导出" : "导出 MP4", () -> control(DownloadService.ACTION_EXPORT, task.id)));
+            }
             if (DownloadTask.QUEUED.equals(task.status) || DownloadTask.RUNNING.equals(task.status)) {
                 actions.addView(smallButton("暂停", () -> control(DownloadService.ACTION_PAUSE_TASK, task.id)));
             } else if (DownloadTask.PAUSED.equals(task.status)) {
@@ -151,11 +167,14 @@ public class DownloadActivity extends AppCompatActivity {
                 actions.addView(smallButton("重试", () -> control(DownloadService.ACTION_RETRY_TASK, task.id)));
             }
             if (!DownloadTask.DELETING.equals(task.status)) {
-                ImageButton delete = deleteButton(DownloadTask.DELETE_FAILED.equals(task.status) ? "重试删除任务及文件" : "删除任务及文件");
+                ImageButton delete = deleteButton(DownloadTask.DONE.equals(task.status)
+                        ? "移除旧版下载记录" : DownloadTask.DELETE_FAILED.equals(task.status)
+                        ? "重试删除原始分段" : "删除原始分段");
                 delete.setOnClickListener(view ->
                         new AlertDialog.Builder(this)
-                                .setTitle("删除下载")
-                                .setMessage("确定删除“" + task.title() + "”及其已下载的文件？此操作无法撤销。")
+                                .setTitle(DownloadTask.DONE.equals(task.status) ? "移除记录" : "删除原始分段")
+                                .setMessage("确定移除“" + task.title()
+                                        + "”的原始分段和下载记录？已导出的 MP4 会保留在系统下载目录。")
                                 .setNegativeButton("取消", null)
                                 .setPositiveButton("删除", (dialog, which) -> {
                                     DownloadService.delete(this, task.id);

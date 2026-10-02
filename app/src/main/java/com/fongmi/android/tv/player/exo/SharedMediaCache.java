@@ -14,17 +14,20 @@ import androidx.media3.datasource.cache.CacheDataSource;
 import androidx.media3.datasource.cache.CacheDataSink;
 import androidx.media3.datasource.cache.CacheEvictor;
 import androidx.media3.datasource.cache.CacheSpan;
+import androidx.media3.datasource.cache.ContentMetadata;
 import androidx.media3.datasource.okhttp.OkHttpDataSource;
 
 import com.fongmi.android.tv.App;
 import com.fongmi.android.tv.download.DownloadStore;
 import com.fongmi.android.tv.download.DownloadTask;
+import com.fongmi.android.tv.download.DownloadManifest;
 import com.fongmi.android.tv.setting.PlayerSetting;
 import com.fongmi.android.tv.setting.PreloadSetting;
 import com.github.catvod.net.OkHttp;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -106,7 +109,82 @@ public final class SharedMediaCache {
         return isHttp(url) && MediaSourceFactory.getCache().getCachedBytes(url, 0, Long.MAX_VALUE) > 0;
     }
 
+    /** Complete HLS segments already saved by playback or preloading, mapped to media time. */
+    public static List<DownloadManifest.Range> cachedRanges(DownloadManifest manifest) {
+        List<DownloadManifest.Range> result = new ArrayList<>();
+        if (manifest == null || !DownloadManifest.HLS.equals(manifest.kind)) return result;
+        Cache cache = MediaSourceFactory.getCache();
+        Set<String> keys = cache.getKeys();
+        long positionUs = 0;
+        for (DownloadManifest.Segment segment : manifest.segments) {
+            long endUs = positionUs + Math.max(0, segment.durationUs);
+            if (keys.contains(segment.url)) {
+                long length = ContentMetadata.getContentLength(cache.getContentMetadata(segment.url));
+                if (length > 0 && cache.isCached(segment.url, 0, length)) {
+                    result.add(new DownloadManifest.Range(positionUs / 1000, endUs / 1000));
+                }
+            }
+            positionUs = endUs;
+        }
+        return result;
+    }
+
+    /** Reconstructs saved playback positions without requiring a download task. */
+    public static PlaybackRanges cachedPlaybackRanges(String url, String mimeType,
+                                                       long durationMs) {
+        List<DownloadManifest.Range> result = new ArrayList<>();
+        if (!isHttp(url)) return new PlaybackRanges(result, durationMs);
+        try {
+            Cache cache = MediaSourceFactory.getCache();
+            CachedHlsTimeline.Snapshot timeline = CachedHlsTimeline.snapshot(cache, url);
+            result.addAll(timeline.ranges());
+            if (!result.isEmpty() || CachedHlsTimeline.isPlaylist(cache, url)
+                    || url.toLowerCase(java.util.Locale.ROOT).contains(".m3u8")
+                    || url.toLowerCase(java.util.Locale.ROOT).contains(".mpd")
+                    || mimeType != null && (mimeType.toLowerCase(java.util.Locale.ROOT).contains("mpegurl")
+                    || mimeType.toLowerCase(java.util.Locale.ROOT).contains("dash+xml"))) {
+                return new PlaybackRanges(result, timeline.durationMs());
+            }
+            long length = ContentMetadata.getContentLength(cache.getContentMetadata(url));
+            boolean mp4Hint = mimeType != null && mimeType.toLowerCase(java.util.Locale.ROOT).contains("video/mp4")
+                    || url.toLowerCase(java.util.Locale.ROOT).contains(".mp4");
+            if (durationMs <= 0 || length <= 0
+                    || !mp4Hint && length <= 2L * 1024 * 1024 && !looksLikeMp4(cache, url))
+                return new PlaybackRanges(result, durationMs);
+            for (CacheSpan span : cache.getCachedSpans(url)) {
+                long start = Math.max(0, Math.min(length, span.position));
+                long end = Math.max(start, Math.min(length, span.position + span.length));
+                if (end > start) {
+                    result.add(new DownloadManifest.Range(
+                            (long) (durationMs * (double) start / length),
+                            (long) (durationMs * (double) end / length)));
+                }
+            }
+        } catch (IOException | RuntimeException ignored) { }
+        return new PlaybackRanges(result, durationMs);
+    }
+
+    public record PlaybackRanges(List<DownloadManifest.Range> ranges, long durationMs) {
+    }
+
+    private static boolean looksLikeMp4(Cache cache, String url) throws IOException {
+        for (CacheSpan span : cache.getCachedSpans(url)) {
+            if (span.position != 0 || span.length < 8 || span.file == null) return false;
+            try (RandomAccessFile input = new RandomAccessFile(span.file, "r")) {
+                input.seek(4);
+                return input.read() == 'f' && input.read() == 't'
+                        && input.read() == 'y' && input.read() == 'p';
+            }
+        }
+        return false;
+    }
+
     public static Response openHttp(DownloadTask task, String url, Map<String, String> headers) throws IOException {
+        return openHttp(task, url, headers, 0);
+    }
+
+    public static Response openHttp(DownloadTask task, String url, Map<String, String> headers,
+                                    long position) throws IOException {
         recordTaskUrl(task, url);
         CacheDataSource dataSource = new CacheDataSource.Factory()
                 .setCache(MediaSourceFactory.getCache())
@@ -114,7 +192,7 @@ public final class SharedMediaCache {
                 .setCacheWriteDataSinkFactory(new CacheDataSink.Factory().setCache(MediaSourceFactory.getCache()).setFragmentSize(2L * 1024 * 1024))
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
                 .createDataSource();
-        DataSpec spec = new DataSpec.Builder().setUri(Uri.parse(url))
+        DataSpec spec = new DataSpec.Builder().setUri(Uri.parse(url)).setPosition(Math.max(0, position))
                 .setHttpRequestHeaders(headers == null ? Map.of() : headers).build();
         long length;
         try {
@@ -166,6 +244,25 @@ public final class SharedMediaCache {
         return result;
     }
 
+    /** Expensive playlist scan, kept separate so cache rows can appear first. */
+    public static Map<String, SegmentStats> listMovieSegmentStats() {
+        Cache cache = MediaSourceFactory.getCache();
+        Map<String, SegmentStats> result = new HashMap<>();
+        for (Group group : groups(cache)) {
+            if (Thread.currentThread().isInterrupted()) break;
+            int cachedSegments = 0;
+            int totalSegments = 0;
+            for (String url : group.keys) {
+                if (Thread.currentThread().isInterrupted()) break;
+                CachedHlsTimeline.Snapshot snapshot = CachedHlsTimeline.mediaSnapshot(cache, url);
+                cachedSegments += snapshot.cachedSegments();
+                totalSegments += snapshot.totalSegments();
+            }
+            result.put(group.movie.id, new SegmentStats(cachedSegments, totalSegments));
+        }
+        return result;
+    }
+
     public static void deleteMovie(String movieId) throws IOException {
         Cache cache = MediaSourceFactory.getCache();
         for (Group group : groups(cache)) {
@@ -185,7 +282,11 @@ public final class SharedMediaCache {
         Movie current = playing;
         if (current != null && current.id.equals(movie.id)) return true;
         for (DownloadTask task : DownloadStore.list(App.get())) {
-            if (DownloadTask.DONE.equals(task.status) || DownloadTask.DELETING.equals(task.status)
+            if (DownloadTask.DONE.equals(task.status) || DownloadTask.DOWNLOADED.equals(task.status)
+                    || DownloadTask.EXPORTING.equals(task.status)
+                    || DownloadTask.EXPORT_FAILED.equals(task.status)
+                    || DownloadTask.EXPORTED.equals(task.status)
+                    || DownloadTask.DELETING.equals(task.status)
                     || DownloadTask.DELETE_FAILED.equals(task.status)) continue;
             String id = task.movieId == null || task.movieId.isEmpty()
                     ? task.siteKey + ":" + task.movieName : task.movieId;
@@ -232,7 +333,11 @@ public final class SharedMediaCache {
         }
     }
 
-    public record CachedMovie(String id, String siteKey, String title, long bytes, long lastAccess, boolean protectedFromDeletion) {
+    public record CachedMovie(String id, String siteKey, String title, long bytes, long lastAccess,
+                              boolean protectedFromDeletion) {
+    }
+
+    public record SegmentStats(int cachedSegments, int totalSegments) {
     }
 
     private record Movie(String id, String siteKey, String name, String episodeName, long lastAccess) {

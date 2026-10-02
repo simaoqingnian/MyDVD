@@ -89,6 +89,7 @@ import com.fongmi.android.tv.bean.Vod;
 import com.fongmi.android.tv.databinding.ActivityVideoBinding;
 import com.fongmi.android.tv.db.AppDatabase;
 import com.fongmi.android.tv.download.DownloadService;
+import com.fongmi.android.tv.download.DownloadManifest;
 import com.fongmi.android.tv.download.DownloadStore;
 import com.fongmi.android.tv.download.DownloadTask;
 import com.fongmi.android.tv.event.CastEvent;
@@ -452,6 +453,16 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         activity.startActivity(intent);
     }
 
+    public static void startOffline(Activity activity, String key, String id, DownloadTask task) {
+        Intent intent = new Intent(activity, VideoActivity.class);
+        intent.putExtra("key", key);
+        intent.putExtra("id", id);
+        intent.putExtra("name", task.movieName);
+        intent.putExtra("offline_task_id", task.id);
+        intent.putExtra("offline_history_key", task.movieId);
+        activity.startActivity(intent);
+    }
+
     private String getName() {
         return Objects.toString(getIntent().getStringExtra("name"), "");
     }
@@ -481,6 +492,8 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
     }
 
     private String getHistoryKey() {
+        String offline = getIntent().getStringExtra("offline_history_key");
+        if (!TextUtils.isEmpty(offline)) return offline;
         return getKey().concat(AppDatabase.SYMBOL).concat(getId()).concat(AppDatabase.SYMBOL) + VodConfig.getCid();
     }
 
@@ -1231,6 +1244,23 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
     }
 
     private void checkId() {
+        String offlineId = getIntent().getStringExtra("offline_task_id");
+        if (!TextUtils.isEmpty(offlineId)) {
+            DownloadTask task = DownloadStore.findById(this, offlineId);
+            DownloadManifest manifest = task == null ? null : DownloadManifest.load(this, task.id);
+            try {
+                if (manifest != null && manifest.complete(this, task.id)) {
+                    Vod vod = new Vod();
+                    vod.setId(getId());
+                    vod.setName(task.movieName);
+                    Flag flag = Flag.create(task.flag);
+                    flag.getEpisodes().add(Episode.create(task.episodeName, task.episodeId));
+                    vod.setFlags(java.util.Collections.singletonList(flag));
+                    setDetail(vod);
+                    return;
+                }
+            } catch (Exception ignored) { }
+        }
         if (getId().startsWith("push://")) getIntent().putExtra("key", SiteApi.PUSH).putExtra("id", getId().substring(7));
         if (getId().isEmpty() || getId().startsWith("msearch:")) setEmpty(false);
         else getDetail();
@@ -1361,6 +1391,9 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
     }
 
     private void getPlayer(Flag flag, Episode episode) {
+        DownloadTask matchingDownload = DownloadStore.findTask(this, getKey(), getHistoryKey(),
+                flag == null ? "" : flag.getFlag(), episode.getUrl());
+        getSeekView().setDownloadTaskId(matchingDownload == null ? null : matchingDownload.id);
         SharedMediaCache.activate(getHistoryKey(), getKey(), mBinding.name.getText().toString(), episode.getName());
         mBinding.control.title.setText(getString(R.string.detail_title, mBinding.name.getText(), episode.getName()));
         playerStartTime = System.currentTimeMillis();
@@ -1378,6 +1411,17 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         mBinding.control.title.setSelected(true);
         updateHistory(episode);
         showProgress();
+        DownloadTask raw = DownloadStore.findCompletedRaw(this, getKey(), getHistoryKey(),
+                flag == null ? "" : flag.getFlag(), episode.getUrl());
+        if (raw != null) {
+            Result local = rawResult(raw);
+            if (local != null) {
+                mBinding.control.title.setText(getString(R.string.detail_title,
+                        mBinding.name.getText(), episode.getName()) + "（离线原始视频）");
+                setPlayer(local);
+                return;
+            }
+        }
         Uri completed = DownloadStore.findCompletedUri(this, getKey(), getHistoryKey(),
                 flag == null ? "" : flag.getFlag(), episode.getUrl());
         if (completed != null) {
@@ -1396,6 +1440,22 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         return result;
     }
 
+    private Result rawResult(DownloadTask task) {
+        DownloadManifest manifest = DownloadManifest.load(this, task.id);
+        if (manifest == null) return null;
+        try {
+            if (!manifest.complete(this, task.id)) return null;
+            Result result = Result.empty();
+            result.setUrl(manifest.localUri(this, task.id).toString());
+            result.setFormat(DownloadManifest.HLS.equals(manifest.kind)
+                    ? "application/x-mpegURL" : "video/mp4");
+            result.setParse(0);
+            return result;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private void switchToCompletedDownloadIfAvailable() {
         if (service() == null || player().isEmpty()) return;
         Flag flag = getFlag();
@@ -1403,17 +1463,30 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
         if (flag == null || episode == null) return;
         String playingUrl = player().getUrl();
         if (playingUrl == null || (!playingUrl.startsWith("http://") && !playingUrl.startsWith("https://"))) return;
+        DownloadTask raw = DownloadStore.findCompletedRaw(this, getKey(), getHistoryKey(),
+                flag.getFlag(), episode.getUrl());
+        if (raw != null) {
+            Result result = rawResult(raw);
+            if (result != null) {
+                switchToLocalDownload(result, "（离线原始视频）");
+                return;
+            }
+        }
         Uri completed = DownloadStore.findCompletedUri(this, getKey(), getHistoryKey(),
                 flag.getFlag(), episode.getUrl());
         if (completed == null) return;
-        Result result = downloadedResult(completed);
+        switchToLocalDownload(downloadedResult(completed), "（已下载）");
+    }
+
+    private void switchToLocalDownload(Result result, String suffix) {
         long position = player().getPosition();
         boolean playWhenReady = player().getPlayer().getPlayWhenReady();
         mQualityAdapter.addAll(result);
         setUseParse(false);
         setQualityVisible(false);
         mBinding.control.parse.setVisibility(View.GONE);
-        mBinding.control.title.setText(getString(R.string.detail_title, mBinding.name.getText(), episode.getName()) + "（已下载）");
+        mBinding.control.title.setText(getString(R.string.detail_title,
+                mBinding.name.getText(), getEpisode().getName()) + suffix);
         player().start(PlaySpec.from(result, getHistoryKey(), buildMetadata()),
                 getSite().getTimeout(), playWhenReady, position);
     }
@@ -1607,6 +1680,16 @@ public class VideoActivity extends PlaybackActivity implements Clock.Callback, C
                         return;
                     }
                     DownloadStore.add(this, tasks);
+                    Episode playingEpisode = getEpisode();
+                    if (playingEpisode != null) {
+                        for (DownloadTask task : tasks) {
+                            if (task.episodeId.equals(playingEpisode.getUrl())
+                                    && task.flag.equals(flag.getFlag())) {
+                                getSeekView().setDownloadTaskId(task.id);
+                                break;
+                            }
+                        }
+                    }
                     DownloadService.start(this, DownloadService.ACTION_RUN);
                     DownloadActivity.start(this);
                 }).create();

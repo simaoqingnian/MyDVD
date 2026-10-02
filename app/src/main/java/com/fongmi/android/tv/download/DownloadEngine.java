@@ -52,11 +52,12 @@ import javax.crypto.spec.SecretKeySpec;
 
 import okhttp3.Response;
 
-/** Resolves a CatVod episode and exports HTTP MP4 or finite HLS media as MP4. */
+/** Saves a CatVod episode as durable raw media, then exports MP4 on request. */
 public final class DownloadEngine {
 
     public interface Callback {
         void progress(int percent) throws InterruptedException;
+        void segments(int downloaded, int total) throws InterruptedException;
         void checkpoint() throws InterruptedException;
     }
 
@@ -70,74 +71,95 @@ public final class DownloadEngine {
         this.callback = callback;
     }
 
-    public String run(DownloadTask task) throws Exception {
+    public void run(DownloadTask task) throws Exception {
         currentTask = task;
         MediaSourceFactory.acquireCacheSession();
+        try {
+            DownloadManifest manifest = DownloadManifest.load(context, task.id);
+            if (manifest == null) manifest = prepare(task);
+            callback.segments(manifest.downloadedSegments(context, task.id), manifest.totalSegments());
+            if (DownloadManifest.HLS.equals(manifest.kind)) downloadHlsSegments(task, manifest);
+            else downloadMp4(task, manifest);
+            if (!manifest.complete(context, task.id)) throw new IOException("原始视频分段尚未完整下载");
+            callback.progress(100);
+        } finally {
+            MediaSourceFactory.releaseCacheSession();
+        }
+    }
+
+    public String export(DownloadTask task) throws Exception {
+        currentTask = task;
+        DownloadManifest manifest = DownloadManifest.load(context, task.id);
+        if (manifest == null || !manifest.complete(context, task.id)) {
+            throw new IOException("原始视频尚未下载完成");
+        }
+        if (DownloadManifest.MP4.equals(manifest.kind)) return publish(manifest.mp4File(context, task.id), task);
         File directory = new File(context.getCacheDir(), "mp4-downloads");
+        if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("无法创建导出临时目录");
         File source = new File(directory, task.id + ".source");
         File output = new File(directory, task.id + ".mp4");
         try {
-            if (!directory.exists() && !directory.mkdirs()) throw new IOException("无法创建下载缓存目录");
-            Result result = SiteApi.playerContentForDownload(task.siteKey, task.flag, task.episodeId);
-            if (result.getDrm() != null) throw new IOException("此线路使用 DRM，无法导出 MP4");
-            Map<String, String> resolvedHeaders = new HashMap<>(result.getHeader());
-            String resolvedUrl = result.getUrl().v();
-            if (result.needParse() || result.shouldUseParse() || !result.getPlayUrl().isEmpty()) {
-                resolvedUrl = parse(result, resolvedHeaders);
-            }
-            if (!resolvedUrl.startsWith("https://") && !resolvedUrl.startsWith("http://")) {
-                throw new IOException("此线路不是可下载的 HTTP 视频地址");
-            }
-            boolean usePlayingUrl = task.preferredUrl != null
-                    && (task.preferredUrl.startsWith("https://") || task.preferredUrl.startsWith("http://"));
-            String url = usePlayingUrl ? task.preferredUrl : resolvedUrl;
-            Map<String, String> headers = usePlayingUrl && task.preferredHeaders != null
-                    ? new HashMap<>(task.preferredHeaders) : resolvedHeaders;
-            callback.progress(1);
-            Response initial;
-            try {
-                initial = request(url, headers);
-            } catch (IOException expired) {
-                if (!usePlayingUrl || url.equals(resolvedUrl)) throw expired;
-                url = resolvedUrl;
-                headers = resolvedHeaders;
-                initial = request(url, headers);
-            }
-            try (Response response = initial) {
-                BufferedInputStream input = new BufferedInputStream(body(response));
-                input.mark(32);
-                byte[] signature = new byte[16];
-                int read = 0;
-                while (read < signature.length) {
-                    int count = input.read(signature, read, signature.length - read);
-                    if (count < 0) break;
-                    read += count;
-                }
-                input.reset();
-                String prefix = new String(signature, 0, Math.max(0, read), StandardCharsets.UTF_8);
-                boolean hls = url.toLowerCase(Locale.ROOT).contains(".m3u8") || prefix.startsWith("#EXTM3U") || contentType(response).contains("mpegurl");
-                if (hls) {
-                    String playlist = readText(input, 2 * 1024 * 1024);
-                    HlsDownload download = downloadHls(url, playlist, headers, source);
-                    callback.progress(85);
-                    remux(source, output, download);
-                } else {
-                    boolean mp4 = read >= 8 && signature[4] == 'f' && signature[5] == 't' && signature[6] == 'y' && signature[7] == 'p';
-                    if (!mp4) throw new IOException("播放地址未返回 MP4 或 HLS 视频");
-                    copy(input, source, response.body().contentLength(), 1, 95);
-                    if (!source.renameTo(output)) copyFile(source, output);
-                }
-            }
+            HlsDownload download = assembleForExport(task, manifest, source);
+            remux(source, output, download);
             if (!output.isFile() || output.length() < 1024) throw new IOException("导出的 MP4 文件为空");
-            callback.progress(97);
-            String uri = publish(output, task);
-            callback.progress(100);
-            return uri;
+            return publish(output, task);
         } finally {
             source.delete();
             output.delete();
-            MediaSourceFactory.releaseCacheSession();
         }
+    }
+
+    private DownloadManifest prepare(DownloadTask task) throws Exception {
+        Result result = SiteApi.playerContentForDownload(task.siteKey, task.flag, task.episodeId);
+        if (result.getDrm() != null) throw new IOException("此线路使用 DRM，无法下载原始视频");
+        Map<String, String> resolvedHeaders = new HashMap<>(result.getHeader());
+        String resolvedUrl = result.getUrl().v();
+        if (result.needParse() || result.shouldUseParse() || !result.getPlayUrl().isEmpty()) {
+            resolvedUrl = parse(result, resolvedHeaders);
+        }
+        if (!resolvedUrl.startsWith("https://") && !resolvedUrl.startsWith("http://")) {
+            throw new IOException("此线路不是可下载的 HTTP 视频地址");
+        }
+        boolean usePlayingUrl = task.preferredUrl != null
+                && (task.preferredUrl.startsWith("https://") || task.preferredUrl.startsWith("http://"));
+        String url = usePlayingUrl ? task.preferredUrl : resolvedUrl;
+        Map<String, String> headers = usePlayingUrl && task.preferredHeaders != null
+                ? new HashMap<>(task.preferredHeaders) : resolvedHeaders;
+        Response initial;
+        try { initial = request(url, headers); }
+        catch (IOException expired) {
+            if (!usePlayingUrl || url.equals(resolvedUrl)) throw expired;
+            url = resolvedUrl;
+            headers = resolvedHeaders;
+            initial = request(url, headers);
+        }
+        DownloadManifest manifest;
+        try (Response response = initial) {
+            BufferedInputStream input = new BufferedInputStream(body(response));
+            input.mark(32);
+            byte[] signature = new byte[16];
+            int read = 0;
+            while (read < signature.length) {
+                int count = input.read(signature, read, signature.length - read);
+                if (count < 0) break;
+                read += count;
+            }
+            input.reset();
+            String prefix = new String(signature, 0, Math.max(0, read), StandardCharsets.UTF_8);
+            boolean hls = url.toLowerCase(Locale.ROOT).contains(".m3u8")
+                    || prefix.startsWith("#EXTM3U") || contentType(response).contains("mpegurl");
+            if (hls) {
+                manifest = parseHls(url, readText(input, 2 * 1024 * 1024), headers);
+            } else {
+                boolean mp4 = read >= 8 && signature[4] == 'f' && signature[5] == 't'
+                        && signature[6] == 'y' && signature[7] == 'p';
+                if (!mp4) throw new IOException("播放地址未返回 MP4 或 HLS 视频");
+                manifest = DownloadManifest.create(DownloadManifest.MP4, url, headers);
+                manifest.contentLength = response.body() == null ? -1 : response.body().contentLength();
+            }
+        }
+        manifest.save(context, task.id);
+        return manifest;
     }
 
     private String parse(Result result, Map<String, String> headers) throws Exception {
@@ -166,7 +188,11 @@ public final class DownloadEngine {
     }
 
     private Response request(String url, Map<String, String> headers) throws IOException {
-        Response response = SharedMediaCache.openHttp(currentTask, url, headers);
+        return request(url, headers, 0);
+    }
+
+    private Response request(String url, Map<String, String> headers, long position) throws IOException {
+        Response response = SharedMediaCache.openHttp(currentTask, url, headers, position);
         if (!response.isSuccessful() || response.body() == null) {
             int code = response.code();
             response.close();
@@ -196,7 +222,7 @@ public final class DownloadEngine {
         return out.toString(StandardCharsets.UTF_8.name());
     }
 
-    private HlsDownload downloadHls(String playlistUrl, String playlist, Map<String, String> headers, File source) throws Exception {
+    private DownloadManifest parseHls(String playlistUrl, String playlist, Map<String, String> headers) throws Exception {
         for (int depth = 0; depth < 4 && playlist.contains("#EXT-X-STREAM-INF"); depth++) {
             String next = selectVariant(playlistUrl, playlist);
             try (Response response = request(next, headers)) {
@@ -205,7 +231,7 @@ public final class DownloadEngine {
             playlistUrl = next;
         }
         if (playlist.contains("#EXT-X-STREAM-INF")) throw new IOException("HLS 多级索引过深");
-        if (!playlist.contains("#EXT-X-ENDLIST")) throw new IOException("直播流无法批量导出为完整 MP4");
+        if (!playlist.contains("#EXT-X-ENDLIST")) throw new IOException("直播流无法完整下载为离线视频");
         if (playlist.contains("#EXT-X-BYTERANGE")) throw new IOException("此 HLS 使用分段字节范围，暂不支持导出");
         long sequence = 0;
         String keyUrl = null;
@@ -247,41 +273,137 @@ public final class DownloadEngine {
             }
         }
         if (segments.isEmpty()) throw new IOException("HLS 没有可下载的分段");
+        DownloadManifest manifest = DownloadManifest.create(DownloadManifest.HLS, playlistUrl, headers);
         for (Segment segment : segments) {
-            if ((segments.get(0).initUrl == null) != (segment.initUrl == null)) {
-                throw new IOException("HLS 在时间轴切换处改变了分段容器格式，无法合并为单个 MP4");
+            manifest.segments.add(new DownloadManifest.Segment(segment.url, segment.keyUrl,
+                    segment.iv, segment.sequence, segment.durationUs, segment.period, segment.initUrl));
+        }
+        return manifest;
+    }
+
+    private void downloadHlsSegments(DownloadTask task, DownloadManifest manifest) throws Exception {
+        File directory = DownloadManifest.directory(context, task.id);
+        if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("无法创建原始下载目录");
+        Map<String, byte[]> keys = new HashMap<>();
+        int done = manifest.downloadedSegments(context, task.id);
+        for (int i = 0; i < manifest.segments.size(); i++) {
+            callback.checkpoint();
+            DownloadManifest.Segment item = manifest.segments.get(i);
+            if (item.initUrl != null) {
+                File init = manifest.initFile(context, task.id, item.period);
+                if (init.length() <= 0) writeSegment(init, item.initUrl, manifest.headers, null, keys);
+            }
+            File file = manifest.segmentFile(context, task.id, i);
+            if (file.length() <= 0) {
+                Segment segment = new Segment(item.url, item.keyUrl, item.iv, item.sequence,
+                        item.durationUs, item.period, item.initUrl);
+                writeSegment(file, item.url, manifest.headers, segment, keys);
+                done++;
+                callback.segments(done, manifest.segments.size());
+                callback.progress((int) (100L * done / manifest.segments.size()));
             }
         }
-        Map<String, byte[]> keys = new HashMap<>();
-        List<SegmentRange> ranges = new ArrayList<>(segments.size());
-        List<SegmentRange> periods = new ArrayList<>(period + 1);
-        try (FileOutputStream out = new FileOutputStream(source)) {
-            for (int i = 0; i < segments.size(); i++) {
+        manifest.writeLocalPlaylist(context, task.id);
+    }
+
+    private void writeSegment(File target, String url, Map<String, String> headers,
+                              Segment segment, Map<String, byte[]> keys) throws Exception {
+        File temporary = new File(target.getParentFile(), target.getName() + ".part");
+        try {
+            if (target.exists() && !target.delete()) throw new IOException("无法重置损坏的分段");
+            try (FileOutputStream output = new FileOutputStream(temporary)) {
+                append(url, headers, output, segment, keys);
+                output.getFD().sync();
+            }
+            if (temporary.length() == 0) throw new IOException("HLS 分段为空：" + target.getName());
+            if (!temporary.renameTo(target)) throw new IOException("无法保存分段：" + target.getName());
+        } finally {
+            temporary.delete();
+        }
+    }
+
+    private void downloadMp4(DownloadTask task, DownloadManifest manifest) throws Exception {
+        File target = manifest.mp4File(context, task.id);
+        if (target.length() >= 1024) return;
+        if (target.exists() && !target.delete()) throw new IOException("无法重置损坏的原始 MP4");
+        File temporary = new File(target.getParentFile(), "source.mp4.part");
+        long resume = temporary.isFile() ? temporary.length() : 0;
+        if (manifest.contentLength > 0 && resume > manifest.contentLength) {
+            if (!temporary.delete()) throw new IOException("无法重置损坏的 MP4 分段");
+            resume = 0;
+        }
+        if (resume >= 1024 && manifest.contentLength > 0 && resume == manifest.contentLength) {
+            if (!temporary.renameTo(target)) throw new IOException("无法保存原始 MP4");
+            callback.segments(1, 1);
+            return;
+        }
+        try (Response response = request(manifest.url, manifest.headers, resume);
+             InputStream input = body(response);
+             FileOutputStream output = new FileOutputStream(temporary, resume > 0)) {
+            byte[] buffer = new byte[65536];
+            long written = resume;
+            int count;
+            while ((count = input.read(buffer)) != -1) {
                 callback.checkpoint();
-                Segment segment = segments.get(i);
-                boolean newPeriod = i == 0 || segment.period != segments.get(i - 1).period;
-                long periodStart = out.getChannel().position();
-                if (newPeriod && segment.initUrl != null) {
-                    append(segment.initUrl, headers, out, null, keys);
+                output.write(buffer, 0, count);
+                written += count;
+                if (manifest.contentLength > 0) {
+                    callback.progress((int) Math.min(99, 100L * written / manifest.contentLength));
                 }
-                long start = out.getChannel().position();
-                append(segment.url, headers, out, segment, keys);
-                long length = out.getChannel().position() - start;
-                if (length == 0) throw new IOException("HLS 分段为空：" + (i + 1));
+            }
+            output.getFD().sync();
+        }
+        if (temporary.length() < 1024 || (manifest.contentLength > 0
+                && temporary.length() != manifest.contentLength)) {
+            throw new IOException("MP4 下载长度不完整，可点击继续下载");
+        }
+        if (!temporary.renameTo(target)) throw new IOException("无法保存原始 MP4");
+        callback.segments(1, 1);
+    }
+
+    private HlsDownload assembleForExport(DownloadTask task, DownloadManifest manifest,
+                                          File source) throws Exception {
+        List<SegmentRange> ranges = new ArrayList<>(manifest.segments.size());
+        List<SegmentRange> periods = new ArrayList<>();
+        int previousPeriod = -1;
+        try (FileOutputStream output = new FileOutputStream(source)) {
+            for (int i = 0; i < manifest.segments.size(); i++) {
+                callback.checkpoint();
+                DownloadManifest.Segment segment = manifest.segments.get(i);
+                boolean newPeriod = i == 0 || segment.period != previousPeriod;
+                long periodStart = output.getChannel().position();
+                if (newPeriod && segment.initUrl != null) {
+                    appendFile(manifest.initFile(context, task.id, segment.period), output);
+                }
+                long start = output.getChannel().position();
+                appendFile(manifest.segmentFile(context, task.id, i), output);
+                long length = output.getChannel().position() - start;
+                if (length == 0) throw new IOException("原始分段为空：" + (i + 1));
                 ranges.add(new SegmentRange(start, length, segment.durationUs));
                 if (newPeriod) {
-                    periods.add(new SegmentRange(periodStart, out.getChannel().position() - periodStart,
-                            segment.durationUs));
+                    periods.add(new SegmentRange(periodStart,
+                            output.getChannel().position() - periodStart, segment.durationUs));
                 } else {
                     SegmentRange previous = periods.remove(periods.size() - 1);
-                    periods.add(new SegmentRange(previous.offset, out.getChannel().position() - previous.offset,
+                    periods.add(new SegmentRange(previous.offset,
+                            output.getChannel().position() - previous.offset,
                             previous.durationUs + segment.durationUs));
                 }
-                callback.progress(2 + (int) (80L * (i + 1) / segments.size()));
+                previousPeriod = segment.period;
             }
+            output.getFD().sync();
         }
-        return new HlsDownload(segments.get(0).initUrl == null && looksLikeTs(source), period > 0,
-                period > 0 ? periods : ranges);
+        boolean discontinuity = periods.size() > 1;
+        boolean transport = manifest.segments.get(0).initUrl == null && looksLikeTs(source);
+        return new HlsDownload(transport, discontinuity, discontinuity ? periods : ranges);
+    }
+
+    private void appendFile(File input, OutputStream output) throws IOException {
+        try (FileInputStream source = new FileInputStream(input)) {
+            byte[] buffer = new byte[65536];
+            int count;
+            while ((count = source.read(buffer)) != -1) output.write(buffer, 0, count);
+        }
     }
 
     private boolean looksLikeTs(File source) throws IOException {
@@ -387,20 +509,6 @@ public final class DownloadEngine {
         return iv;
     }
 
-    private void copy(InputStream input, File target, long length, int start, int end) throws Exception {
-        long total = 0;
-        try (FileOutputStream out = new FileOutputStream(target)) {
-            byte[] buffer = new byte[65536];
-            int count;
-            while ((count = input.read(buffer)) != -1) {
-                callback.checkpoint();
-                out.write(buffer, 0, count);
-                total += count;
-                if (length > 0) callback.progress(start + (int) ((end - start) * Math.min(total, length) / length));
-            }
-        }
-    }
-
     private void copyFile(File source, File target) throws IOException {
         try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(target)) {
             byte[] buffer = new byte[65536];
@@ -456,8 +564,20 @@ public final class DownloadEngine {
                         muxer.start();
                         started = true;
                     }
-                    int[] tracks = layout.selectTracks(extractor, input.getFD(), offset, length,
-                            verifyFormats && part > 0);
+                    int[] tracks;
+                    try {
+                        tracks = layout.selectTracks(extractor, input.getFD(), offset, length,
+                                verifyFormats && part > 0);
+                    } catch (IncompatiblePeriodException mismatch) {
+                        // Some playlists insert short clips encoded differently between two
+                        // stretches of the same movie. Only omit a clip when the following
+                        // period returns to the movie's original track layout.
+                        if (!isShortInterstitial(ranges, part)
+                                || !nextPeriodMatches(input.getFD(), ranges.get(part + 1), layout)) {
+                            throw mismatch;
+                        }
+                        continue;
+                    }
                     long lastSampleUs = writeSamples(extractor, muxer, layout, tracks, partStartUs);
                     if (ranges != null) {
                         long durationUs = ranges.get(part).durationUs;
@@ -486,6 +606,26 @@ public final class DownloadEngine {
                 }
                 muxer.release();
             }
+        }
+    }
+
+    private boolean isShortInterstitial(List<SegmentRange> ranges, int part) {
+        return ranges != null && part > 0 && part + 1 < ranges.size()
+                && ranges.get(part).durationUs > 0
+                && ranges.get(part).durationUs <= 30_000_000L;
+    }
+
+    private boolean nextPeriodMatches(FileDescriptor fd, SegmentRange next,
+                                      TrackLayout layout) {
+        MediaExtractor probe = new MediaExtractor();
+        try {
+            probe.setDataSource(fd, next.offset, next.length);
+            layout.selectTracks(probe, fd, next.offset, next.length, true);
+            return true;
+        } catch (IOException | RuntimeException mismatch) {
+            return false;
+        } finally {
+            probe.release();
         }
     }
 
@@ -533,7 +673,8 @@ public final class DownloadEngine {
     }
 
     private String publish(File file, DownloadTask task) throws Exception {
-        String filename = safeName(task.title()) + "-" + task.id.substring(0, 8) + ".mp4";
+        String filename = safeName(task.title()) + "-" + task.id.substring(0, 8)
+                + "-" + System.currentTimeMillis() + ".mp4";
         if (Build.VERSION.SDK_INT >= 29) {
             ContentValues values = new ContentValues();
             values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
@@ -542,7 +683,6 @@ public final class DownloadEngine {
             values.put(MediaStore.MediaColumns.IS_PENDING, 1);
             Uri uri = context.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
             if (uri == null) throw new IOException("无法写入系统下载目录");
-            task.outputUri = uri.toString();
             try {
                 try (InputStream in = new FileInputStream(file); OutputStream out = context.getContentResolver().openOutputStream(uri)) {
                     if (out == null) throw new IOException("无法打开系统下载文件");
@@ -556,7 +696,6 @@ public final class DownloadEngine {
                 return uri.toString();
             } catch (Exception error) {
                 context.getContentResolver().delete(uri, null, null);
-                task.outputUri = "";
                 throw error;
             }
         }
@@ -564,13 +703,11 @@ public final class DownloadEngine {
         if (directory == null) throw new IOException("设备没有可用的下载目录");
         if (!directory.exists() && !directory.mkdirs()) throw new IOException("无法创建下载目录");
         File target = new File(directory, filename);
-        task.outputUri = FileProvider.getUriForFile(context, context.getPackageName() + ".provider", target).toString();
         try {
             copyFile(file, target);
-            return task.outputUri;
+            return FileProvider.getUriForFile(context, context.getPackageName() + ".provider", target).toString();
         } catch (Exception error) {
             target.delete();
-            task.outputUri = "";
             throw error;
         }
     }
@@ -626,6 +763,12 @@ public final class DownloadEngine {
         }
     }
 
+    private static final class IncompatiblePeriodException extends IOException {
+        IncompatiblePeriodException(String message) {
+            super(message);
+        }
+    }
+
     private static final class TrackLayout {
         final List<String> mimes = new ArrayList<>();
         final List<MediaFormat> formats = new ArrayList<>();
@@ -670,7 +813,7 @@ public final class DownloadEngine {
                         if (verifyFormats) {
                             VideoCodecConfig.ensure(format, mime, fd, offset, length, source);
                             if (!sameFormat(formats.get(target), format, mime)) {
-                                throw new IOException("HLS 时间轴切换处音视频编码或参数变化，无法合并为单个 MP4：" + mime);
+                                throw new IncompatiblePeriodException("HLS 时间轴切换处音视频编码或参数变化，无法合并为单个 MP4：" + mime);
                             }
                         }
                         tracks[source] = target;
@@ -679,14 +822,14 @@ public final class DownloadEngine {
                         break;
                     }
                 }
-                if (!found) throw new IOException("HLS 分段缺少音视频轨道：" + mimes.get(target));
+                if (!found) throw new IncompatiblePeriodException("HLS 分段缺少音视频轨道：" + mimes.get(target));
             }
             if (verifyFormats) {
                 for (int source = 0; source < tracks.length; source++) {
                     if (tracks[source] >= 0) continue;
                     String mime = extractor.getTrackFormat(source).getString(MediaFormat.KEY_MIME);
                     if (mime != null && (mime.startsWith("video/") || mime.startsWith("audio/"))) {
-                        throw new IOException("HLS 时间轴切换处增加了音视频轨道，无法合并为单个 MP4：" + mime);
+                        throw new IncompatiblePeriodException("HLS 时间轴切换处增加了音视频轨道，无法合并为单个 MP4：" + mime);
                     }
                 }
             }

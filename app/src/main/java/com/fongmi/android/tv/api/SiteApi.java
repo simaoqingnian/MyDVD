@@ -60,13 +60,21 @@ public class SiteApi {
             Spider spider = site.recent().spider();
             boolean crash = Prefers.getBoolean("crash");
             String home = crash ? "" : spider.homeContent(true);
-            String video = crash ? "" : spider.homeVideoContent();
             Prefers.put("crash", false);
             SpiderDebug.log("home", home);
-            SpiderDebug.log("homeVideo", video);
             Result result = Result.fromJson(home);
-            List<Vod> list = Result.fromJson(video).getList();
-            if (!list.isEmpty()) result.setList(list);
+            if (!crash) {
+                try {
+                    String video = spider.homeVideoContent();
+                    SpiderDebug.log("homeVideo", video);
+                    List<Vod> list = Result.fromJson(video).getList();
+                    if (!list.isEmpty()) result.setList(list);
+                } catch (Exception error) {
+                    if (Thread.currentThread().isInterrupted() || error instanceof InterruptedException)
+                        throw error;
+                    SpiderDebug.log("homeVideo", "failed site=%s error=%s", site.getKey(), error);
+                }
+            }
             setTypes(site, result);
             return result;
         } else if (site.getType() == 4) {
@@ -263,7 +271,11 @@ public class SiteApi {
         params.put("ac", ac(site.getType()));
         params.put("ids", TextUtils.join(",", ids));
         try (Response response = OkHttp.newCall(site.getApi(), site.getHeader(), params).execute()) {
-            result.setList(Result.fromType(site.getType(), response.body().string()).getList());
+            List<Vod> details = Result.fromType(site.getType(), response.body().string()).getList();
+            if (!details.isEmpty()) result.setList(details);
+            return result;
+        } catch (IOException | RuntimeException error) {
+            SpiderDebug.log("fetchPic", "failed site=%s error=%s", site.getKey(), error);
             return result;
         }
     }

@@ -33,6 +33,7 @@ public class DownloadService extends Service {
     public static final String ACTION_DELETE = "com.mydvd.app.DOWNLOAD_DELETE";
     public static final String ACTION_START_ALL = "com.mydvd.app.DOWNLOAD_START_ALL";
     public static final String ACTION_PAUSE_ALL = "com.mydvd.app.DOWNLOAD_PAUSE_ALL";
+    public static final String ACTION_EXPORT = "com.mydvd.app.DOWNLOAD_EXPORT";
     private static final String EXTRA_TASK_ID = "task_id";
     private static final String CHANNEL = "mydvd_downloads";
     private static final int NOTIFICATION = 4862;
@@ -85,6 +86,7 @@ public class DownloadService extends Service {
                 if (ACTION_PAUSE_TASK.equals(action)) DownloadStore.pauseTask(this, taskId);
                 else if (ACTION_RESUME_TASK.equals(action)) DownloadStore.resumeTask(this, taskId);
                 else if (ACTION_RETRY_TASK.equals(action)) DownloadStore.retryTask(this, taskId);
+                else if (ACTION_EXPORT.equals(action)) DownloadStore.requestExport(this, taskId);
                 else if (ACTION_DELETE.equals(action)) DownloadStore.markDeleting(this, taskId);
             }
             lastStartId = startId;
@@ -112,6 +114,12 @@ public class DownloadService extends Service {
             }
             for (DownloadTask task : DownloadStore.list(this)) {
                 if (active.size() >= limit) break;
+                if (!DownloadTask.EXPORTING.equals(task.status) || active.containsKey(task.id)) continue;
+                active.put(task.id, task);
+                workers.execute(() -> exportTask(task));
+            }
+            for (DownloadTask task : DownloadStore.list(this)) {
+                if (active.size() >= limit) break;
                 if (!DownloadTask.QUEUED.equals(task.status) || active.containsKey(task.id)) continue;
                 task.status = DownloadTask.RUNNING;
                 task.error = "";
@@ -127,32 +135,12 @@ public class DownloadService extends Service {
     private void runTask(DownloadTask task) {
         boolean completed = false;
         try {
-            String uri = new DownloadEngine(this, new DownloadEngine.Callback() {
-                @Override
-                public void progress(int percent) throws InterruptedException {
-                    synchronized (lifecycleLock) {
-                        if (percent < 100) checkpoint();
-                        if (percent != task.progress) {
-                            task.progress = Math.max(0, Math.min(percent, 100));
-                            save(task);
-                        }
-                    }
-                }
-
-                @Override
-                public void checkpoint() throws InterruptedException {
-                    if (DownloadStore.isDeleting(DownloadService.this, task.id)) throw new InterruptedException("已删除");
-                    if (DownloadStore.isPausedTask(DownloadService.this, task.id)) throw new InterruptedException("已暂停");
-                    if (throttled.contains(task.id)) throw new InterruptedException("并发数已降低");
-                }
-            }).run(task);
+            new DownloadEngine(this, callback(task, false)).run(task);
             synchronized (lifecycleLock) {
-                task.outputUri = uri;
                 if (DownloadStore.isDeleting(this, task.id)) {
-                    DownloadStore.update(this, task);
                     removeTask(task);
                 } else {
-                    task.status = DownloadTask.DONE;
+                    task.status = DownloadTask.DOWNLOADED;
                     task.progress = 100;
                     save(task);
                     completed = true;
@@ -163,14 +151,77 @@ public class DownloadService extends Service {
         } catch (Exception error) {
             failTask(task, error, false);
         } finally {
-            synchronized (lifecycleLock) {
-                active.remove(task.id);
-                throttled.remove(task.id);
-            }
-            try { coordinator.execute(this::dispatch); }
-            catch (java.util.concurrent.RejectedExecutionException ignored) { }
+            finishWorker(task);
         }
         if (completed) SharedMediaCache.pruneAsync();
+    }
+
+    private void exportTask(DownloadTask task) {
+        try {
+            String uri = new DownloadEngine(this, callback(task, true)).export(task);
+            synchronized (lifecycleLock) {
+                task.outputUri = uri;
+                if (DownloadStore.isDeleting(this, task.id)) removeTask(task);
+                else {
+                    task.status = DownloadTask.EXPORTED;
+                    save(task);
+                }
+            }
+        } catch (Exception error) {
+            synchronized (lifecycleLock) {
+                if (DownloadStore.isDeleting(this, task.id)) removeTask(task);
+                else {
+                    task.status = DownloadTask.EXPORT_FAILED;
+                    task.error = error.getMessage() == null
+                            ? error.getClass().getSimpleName() : error.getMessage();
+                    save(task);
+                }
+            }
+        } finally {
+            finishWorker(task);
+        }
+    }
+
+    private DownloadEngine.Callback callback(DownloadTask task, boolean exporting) {
+        return new DownloadEngine.Callback() {
+            @Override public void progress(int percent) throws InterruptedException {
+                if (exporting) { checkpoint(); return; }
+                synchronized (lifecycleLock) {
+                    if (percent < 100) checkpoint();
+                    if (percent != task.progress) {
+                        task.progress = Math.max(0, Math.min(percent, 100));
+                        save(task);
+                    }
+                }
+            }
+
+            @Override public void segments(int downloaded, int total) throws InterruptedException {
+                if (exporting) return;
+                synchronized (lifecycleLock) {
+                    checkpoint();
+                    if (task.segmentsDownloaded != downloaded || task.segmentsTotal != total) {
+                        task.segmentsDownloaded = downloaded;
+                        task.segmentsTotal = total;
+                        save(task);
+                    }
+                }
+            }
+
+            @Override public void checkpoint() throws InterruptedException {
+                if (DownloadStore.isDeleting(DownloadService.this, task.id)) throw new InterruptedException("已删除");
+                if (!exporting && DownloadStore.isPausedTask(DownloadService.this, task.id)) throw new InterruptedException("已暂停");
+                if (!exporting && throttled.contains(task.id)) throw new InterruptedException("并发数已降低");
+            }
+        };
+    }
+
+    private void finishWorker(DownloadTask task) {
+        synchronized (lifecycleLock) {
+            active.remove(task.id);
+            throttled.remove(task.id);
+        }
+        try { coordinator.execute(this::dispatch); }
+        catch (java.util.concurrent.RejectedExecutionException ignored) { }
     }
 
     private void failTask(DownloadTask task, Exception error, boolean interrupted) {
@@ -219,15 +270,18 @@ public class DownloadService extends Service {
     private Notification notification(DownloadTask task) {
         int running;
         synchronized (lifecycleLock) { running = active.size(); }
-        String title = running > 0 ? "正在下载 " + running + " 项" : "DVD 下载";
-        String state = task == null ? "等待任务" : task.title() + " · " + task.progress + "%";
+        boolean exporting = task != null && DownloadTask.EXPORTING.equals(task.status);
+        String title = exporting ? "正在导出 MP4" : running > 0 ? "正在下载 " + running + " 项" : "DVD 下载";
+        String state = task == null ? "等待任务" : task.title() + (exporting ? ""
+                : " · " + task.segmentsDownloaded + "/" + task.segmentsTotal
+                + " 段 · " + task.progress + "%");
         NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setContentTitle(title)
                 .setContentText(state)
                 .setOngoing(running > 0)
                 .setOnlyAlertOnce(true);
-        if (running > 0) {
+        if (running > 0 && !exporting) {
             Intent intent = new Intent(this, DownloadService.class).setAction(ACTION_PAUSE_ALL);
             PendingIntent pause = PendingIntent.getService(this, 0, intent,
                     PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);

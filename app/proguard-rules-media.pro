@@ -32,6 +32,11 @@
 -keepattributes *Annotation*,InnerClasses,EnclosingMethod
 
 -keep class androidx.media3.decoder.VideoDecoderOutputBuffer { *; }
+-keepclassmembers class androidx.media3.ui.DefaultTimeBar {
+  private android.graphics.Rect progressBar;
+  private android.graphics.Rect scrubberBar;
+  private android.graphics.Paint bufferedPaint;
+}
 -keep class androidx.media3.decoder.DecoderInputBuffer { *; }
 -keep class androidx.media3.decoder.av1.Dav1dDecoder { *; }
 -keep class androidx.media3.decoder.SimpleDecoderOutputBuffer { *; }

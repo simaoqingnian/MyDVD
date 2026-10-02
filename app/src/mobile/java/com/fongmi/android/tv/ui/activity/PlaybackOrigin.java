@@ -8,6 +8,8 @@ import androidx.appcompat.app.AlertDialog;
 import com.fongmi.android.tv.api.config.VodConfig;
 import com.fongmi.android.tv.bean.Site;
 import com.fongmi.android.tv.db.AppDatabase;
+import com.fongmi.android.tv.download.DownloadManifest;
+import com.fongmi.android.tv.download.DownloadTask;
 
 /** Opens the film detail page recorded by downloads and shared playback cache. */
 final class PlaybackOrigin {
@@ -25,6 +27,15 @@ final class PlaybackOrigin {
     }
 
     static void open(Activity activity, String historyKey, String siteKey, String title) {
+        open(activity, historyKey, siteKey, title, null);
+    }
+
+    static void open(Activity activity, DownloadTask task) {
+        open(activity, task.movieId, task.siteKey, task.movieName, task);
+    }
+
+    private static void open(Activity activity, String historyKey, String siteKey, String title,
+                             DownloadTask task) {
         String key = siteKey(historyKey, siteKey);
         String vodId = vodId(historyKey, key);
         if (TextUtils.isEmpty(key) || TextUtils.isEmpty(vodId)) {
@@ -39,21 +50,30 @@ final class PlaybackOrigin {
         boolean configChanged = !TextUtils.isEmpty(cid) && !cid.equals(String.valueOf(VodConfig.getCid()));
         String selectedKey = VodConfig.get().getHome().getKey();
         boolean selectedSiteChanged = !TextUtils.isEmpty(selectedKey) && !key.equals(selectedKey);
+        DownloadManifest manifest = task == null ? null : DownloadManifest.load(activity, task.id);
+        boolean offlineReady = false;
+        try { offlineReady = manifest != null && manifest.complete(activity, task.id); }
+        catch (Exception ignored) { }
+        final boolean canPlayOffline = offlineReady;
         if (!siteAvailable || configChanged || selectedSiteChanged) {
             String reason = !siteAvailable ? "当前源配置中没有这个片源。"
                     : configChanged ? "当前源配置与记录时不同。" : "当前选中的片源与记录来源不同。";
             AlertDialog.Builder dialog = new AlertDialog.Builder(activity)
                     .setTitle("播放来源不匹配")
                     .setMessage(sourceLabel(siteKey, historyKey) + "\n" + reason
-                            + "\n请切换回原来的源配置后再打开，当前源可能找不到这部影片。")
+                            + (offlineReady ? "\n原始分段已下载完成，可以直接离线播放。"
+                            : "\n请切换回原来的源配置后再打开，当前源可能找不到这部影片。"))
                     .setNegativeButton("取消", null);
-            if (siteAvailable) dialog.setPositiveButton("仍然打开", (ignored, which) ->
-                    VideoActivity.start(activity, key, vodId, title));
+            if (siteAvailable || offlineReady) dialog.setPositiveButton(offlineReady ? "打开离线影片" : "仍然打开", (ignored, which) -> {
+                if (canPlayOffline && task != null) VideoActivity.startOffline(activity, key, vodId, task);
+                else VideoActivity.start(activity, key, vodId, title);
+            });
             else dialog.setPositiveButton("知道了", null);
             dialog.show();
             return;
         }
-        VideoActivity.start(activity, key, vodId, title);
+        if (offlineReady && task != null) VideoActivity.startOffline(activity, key, vodId, task);
+        else VideoActivity.start(activity, key, vodId, title);
     }
 
     private static String siteKey(String historyKey, String fallback) {
