@@ -18,7 +18,9 @@ public final class DownloadStore {
     private static final String PREFS = "mydvd_downloads";
     private static final String TASKS = "tasks";
     private static final String CONCURRENCY = "concurrency";
+    private static final String SEGMENT_CONCURRENCY = "segment_concurrency";
     public static final int MAX_CONCURRENCY = 10;
+    public static final int MAX_SEGMENT_CONCURRENCY = 10;
     private static final Type LIST_TYPE = TypeToken.getParameterized(List.class, DownloadTask.class).getType();
 
     private DownloadStore() {
@@ -34,6 +36,16 @@ public final class DownloadStore {
 
     public static void setConcurrency(Context context, int count) {
         prefs(context).edit().putInt(CONCURRENCY, Math.max(1, Math.min(MAX_CONCURRENCY, count))).apply();
+    }
+
+    public static int getSegmentConcurrency(Context context) {
+        return Math.max(1, Math.min(MAX_SEGMENT_CONCURRENCY,
+                prefs(context).getInt(SEGMENT_CONCURRENCY, 1)));
+    }
+
+    public static void setSegmentConcurrency(Context context, int count) {
+        prefs(context).edit().putInt(SEGMENT_CONCURRENCY,
+                Math.max(1, Math.min(MAX_SEGMENT_CONCURRENCY, count))).apply();
     }
 
     public static synchronized List<DownloadTask> list(Context context) {

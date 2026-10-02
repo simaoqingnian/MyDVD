@@ -36,10 +36,18 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -284,24 +292,64 @@ public final class DownloadEngine {
     private void downloadHlsSegments(DownloadTask task, DownloadManifest manifest) throws Exception {
         File directory = DownloadManifest.directory(context, task.id);
         if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("无法创建原始下载目录");
-        Map<String, byte[]> keys = new HashMap<>();
-        int done = manifest.downloadedSegments(context, task.id);
-        for (int i = 0; i < manifest.segments.size(); i++) {
+        Map<String, byte[]> keys = new ConcurrentHashMap<>();
+        Set<Integer> initialized = new HashSet<>();
+        for (DownloadManifest.Segment item : manifest.segments) {
             callback.checkpoint();
-            DownloadManifest.Segment item = manifest.segments.get(i);
-            if (item.initUrl != null) {
-                File init = manifest.initFile(context, task.id, item.period);
-                if (init.length() <= 0) writeSegment(init, item.initUrl, manifest.headers, null, keys);
-            }
-            File file = manifest.segmentFile(context, task.id, i);
-            if (file.length() <= 0) {
-                Segment segment = new Segment(item.url, item.keyUrl, item.iv, item.sequence,
-                        item.durationUs, item.period, item.initUrl);
-                writeSegment(file, item.url, manifest.headers, segment, keys);
+            if (item.initUrl == null || !initialized.add(item.period)) continue;
+            File init = manifest.initFile(context, task.id, item.period);
+            if (init.length() <= 0) writeSegment(init, item.initUrl, manifest.headers, null, keys);
+        }
+        int done = manifest.downloadedSegments(context, task.id);
+        ExecutorService workers = Executors.newFixedThreadPool(DownloadStore.MAX_SEGMENT_CONCURRENCY);
+        ExecutorCompletionService<Integer> completed = new ExecutorCompletionService<>(workers);
+        try {
+            int next = 0;
+            int running = 0;
+            while (next < manifest.segments.size() || running > 0) {
+                callback.checkpoint();
+                int limit = DownloadStore.getSegmentConcurrency(context);
+                while (running < limit && next < manifest.segments.size()) {
+                    int index = next++;
+                    File file = manifest.segmentFile(context, task.id, index);
+                    if (file.length() > 0) continue;
+                    DownloadManifest.Segment item = manifest.segments.get(index);
+                    completed.submit(() -> {
+                        callback.checkpoint();
+                        Segment segment = new Segment(item.url, item.keyUrl, item.iv, item.sequence,
+                                item.durationUs, item.period, item.initUrl);
+                        writeSegment(file, item.url, manifest.headers, segment, keys);
+                        return index;
+                    });
+                    running++;
+                }
+                if (running == 0) continue;
+                Future<Integer> finished = completed.poll(250, TimeUnit.MILLISECONDS);
+                if (finished == null) continue;
+                try {
+                    finished.get();
+                } catch (ExecutionException error) {
+                    Throwable cause = error.getCause();
+                    if (cause instanceof Exception exception) throw exception;
+                    if (cause instanceof Error fatal) throw fatal;
+                    throw new IOException("HLS 分段下载失败", cause);
+                }
+                running--;
                 done++;
                 callback.segments(done, manifest.segments.size());
                 callback.progress((int) (100L * done / manifest.segments.size()));
             }
+        } finally {
+            workers.shutdownNow();
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    if (workers.awaitTermination(1, TimeUnit.SECONDS)) break;
+                } catch (InterruptedException error) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
         }
         manifest.writeLocalPlaylist(context, task.id);
     }

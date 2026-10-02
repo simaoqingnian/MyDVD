@@ -40,7 +40,8 @@ public class DownloadActivity extends AppCompatActivity {
         }
     };
     private LinearLayout list;
-    private Button concurrencyButton;
+    private Button taskConcurrencyButton;
+    private Button segmentConcurrencyButton;
     private String lastState = "";
 
     public static void start(Activity activity) {
@@ -60,10 +61,15 @@ public class DownloadActivity extends AppCompatActivity {
         TextView title = text("下载管理", 22);
         root.addView(title);
         root.addView(button("管理播放缓存", () -> PlaybackCacheActivity.start(this)));
+        LinearLayout settings = new LinearLayout(this);
+        settings.setOrientation(LinearLayout.HORIZONTAL);
+        taskConcurrencyButton = smallButton("", this::chooseConcurrency);
+        segmentConcurrencyButton = smallButton("", this::chooseSegmentConcurrency);
+        settings.addView(taskConcurrencyButton, new LinearLayout.LayoutParams(0, dp(36), 1));
+        settings.addView(segmentConcurrencyButton, new LinearLayout.LayoutParams(0, dp(36), 1));
+        root.addView(settings);
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.HORIZONTAL);
-        concurrencyButton = smallButton("", this::chooseConcurrency);
-        controls.addView(concurrencyButton, new LinearLayout.LayoutParams(0, dp(36), 1));
         controls.addView(smallButton("全部开始", () -> controlAll(DownloadService.ACTION_START_ALL)),
                 new LinearLayout.LayoutParams(0, dp(36), 1));
         controls.addView(smallButton("全部暂停", () -> controlAll(DownloadService.ACTION_PAUSE_ALL)),
@@ -80,7 +86,7 @@ public class DownloadActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        updateConcurrencyLabel();
+        updateConcurrencyLabels();
         render();
         handler.postDelayed(refresh, 2000);
     }
@@ -247,16 +253,32 @@ public class DownloadActivity extends AppCompatActivity {
         new AlertDialog.Builder(this).setTitle("同时下载任务数")
                 .setSingleChoiceItems(options, DownloadStore.getConcurrency(this) - 1, (dialog, which) -> {
                     DownloadStore.setConcurrency(this, which + 1);
-                    updateConcurrencyLabel();
+                    updateConcurrencyLabels();
                     DownloadService.start(this, DownloadService.ACTION_RUN);
                     dialog.dismiss();
                 })
                 .setNegativeButton("取消", null).show();
     }
 
-    private void updateConcurrencyLabel() {
-        if (concurrencyButton != null) {
-            concurrencyButton.setText("并发 " + DownloadStore.getConcurrency(this));
+    private void chooseSegmentConcurrency() {
+        String[] options = new String[DownloadStore.MAX_SEGMENT_CONCURRENCY];
+        for (int i = 0; i < options.length; i++) options[i] = String.valueOf(i + 1);
+        new AlertDialog.Builder(this).setTitle("单任务 HLS 分段并发数（所有任务）")
+                .setSingleChoiceItems(options, DownloadStore.getSegmentConcurrency(this) - 1,
+                        (dialog, which) -> {
+                            DownloadStore.setSegmentConcurrency(this, which + 1);
+                            updateConcurrencyLabels();
+                            dialog.dismiss();
+                        })
+                .setNegativeButton("取消", null).show();
+    }
+
+    private void updateConcurrencyLabels() {
+        if (taskConcurrencyButton != null) {
+            taskConcurrencyButton.setText("同时任务 " + DownloadStore.getConcurrency(this));
+        }
+        if (segmentConcurrencyButton != null) {
+            segmentConcurrencyButton.setText("单任务分段 " + DownloadStore.getSegmentConcurrency(this));
         }
     }
 
